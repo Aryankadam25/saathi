@@ -1,4 +1,4 @@
-import os, json, re, sqlite3, tempfile, datetime
+import os, json, re, sqlite3, tempfile, datetime, wave, io
 import streamlit as st
 import pandas as pd
 from sarvamai import SarvamAI
@@ -63,7 +63,26 @@ def seed():
     c.close()
 
 # ---------- Sarvam calls ----------
+def trim_wav(wav_bytes, max_sec=28):
+    try:
+        with wave.open(io.BytesIO(wav_bytes), "rb") as w:
+            params = w.getparams()
+            max_frames = int(max_sec * w.getframerate())
+            if w.getnframes() <= max_frames:
+                return wav_bytes, False
+            frames = w.readframes(max_frames)
+        out = io.BytesIO()
+        with wave.open(out, "wb") as o:
+            o.setparams(params)
+            o.writeframes(frames)
+        return out.getvalue(), True
+    except Exception:
+        return wav_bytes, False
+
 def stt(wav_bytes):
+    wav_bytes, trimmed = trim_wav(wav_bytes)
+    if trimmed:
+        st.info("Recording was longer than 30 seconds, so only the first 28 seconds were used.")
     with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as t:
         t.write(wav_bytes)
         path = t.name
