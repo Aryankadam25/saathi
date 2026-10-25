@@ -1,325 +1,202 @@
-"""Saathi — multilingual wellness voice agent (Streamlit single-file demo)."""
-import os, json, base64, sqlite3, textwrap
-from datetime import datetime
-from typing import Optional
-
+import os, json, re, sqlite3, tempfile, datetime
 import streamlit as st
-from pydantic import BaseModel, Field
+import pandas as pd
 from sarvamai import SarvamAI
+from sarvamai.play import save
 
-# ---------------------------------------------------------------------------
-# Configuration
-# ---------------------------------------------------------------------------
-client = None  # SarvamAI(api_subscription_key=os.environ.get("SARVAM_API_KEY"))
-DB_PATH = os.environ.get("SAATHI_DB", "saathi.db")
-API_KEY = os.environ.get("SARVAM_API_KEY", "")
-USE_TEST_CLIP = os.environ.get("SAATHI_USE_TEST", "false").lower() == "true"
-TEST_CLIP_PATH = os.environ.get("SAATHI_TEST_CLIP", "")
+st.set_page_config(page_title="Saathi", page_icon="🎙️", layout="wide")
+KEY = os.environ.get("SARVAM_API_KEY")
+if not KEY:
+    st.error("Set the SARVAM_API_KEY environment variable and restart.")
+    st.stop()
+client = SarvamAI(api_subscription_key=KEY)
+ss = st.session_state
 
-# ---------------------------------------------------------------------------
-# Types
-# ---------------------------------------------------------------------------
-class RiskResult(BaseModel):
-    tier: str = Field(ge=0, le=3, description="0=green 1=green 2=amber 3=red")
-    likelihood: str = Field(description="Estimated likelihood")
-    factors: list = Field(description="List of identified factors")
-    remediation: str = Field(description="Suggested next steps")
+RANK = {"green": 0, "amber": 1, "red": 2}
+ICON = {"green": "🟢", "amber": "🟡", "red": "🔴"}
+OPENER = ("Namaste! Main Saathi hoon, ek AI assistant. Aapke Student Guide ko is check-in ka summary dikhega. "
+          "Aap Hindi, Marathi ya English mein baat kar sakte hain. Is hafte kaisa raha?")
+RED_MSG = ("Aapne jo bataya, wo bahut maayne rakhta hai, aur main nahi chahta ki aap akele rahein. "
+           "Aapke Student Guide ko aapse baat karne ke liye abhi bataya ja raha hai. "
+           "Agar aap abhi bahut pareshaan hain, to kisi bharosemand insaan se baat karein "
+           "ya Tele-MANAS helpline 14416 par call karein.")
+# Extend these patterns (Hindi, Marathi, English, romanized). They can only RAISE the risk tier.
+RED_PATTERNS = [
+    r"fayd[ae]\s+(hi\s+)?nahi", r"फ़?ायदा\s+(ही\s+)?नहीं", r"फ़ायदा\s+(ही\s+)?नहीं",
+    r"jeen[ae]\s+(ka\s+mann\s+)?nahi", r"जीने\s+का\s+मन\s+नहीं", r"जीना\s+नहीं",
+    r"mar\s*jau", r"marna\s+chah", r"मर\s*जा", r"मरना\s+चा",
+    r"sab\s+khatam", r"सब\s+खत्म",
+    r"upyog\s+nahi", r"उपयोग\s+नाही", r"jagavasa\s+vatat\s+nahi", r"मरावंसं", r"maravasa",
+    r"suicide", r"kill myself", r"end (it all|my life)", r"want to die", r"no point", r"hopeless", r"can'?t go on",
+]
+AGENT_SYS = ("You are Saathi, a warm AI wellness check-in assistant for college students in India. "
+             "The greeting already asked how their week was. Reply in the same language and style the student used "
+             "(Hindi, Marathi, English or Hinglish). Maximum 2 short, kind sentences. Ask at most one gentle question. "
+             "Never diagnose, never give medical advice, never mention hotlines.")
+TURN_HINT = ["Next, gently ask about their sleep or how they have been feeling.",
+             "Next, gently ask about academic pressure and who they can talk to.",
+             "This is the last turn: thank them warmly, say their Student Guide is there to help. Ask no question."]
+ANALYSIS_PROMPT = ("You help a college Wellness Council triage a student wellness check-in. Read the student's words and return "
+                   "ONLY a JSON object with keys: stress_score (integer 1-5), themes (list of short English strings), "
+                   "risk_tier (one of green, amber, red), key_quote (a short exact quote from the student), "
+                   "english_summary (2 neutral sentences in English, no diagnosis). If unsure between two tiers, choose the higher one.")
 
-class SafetyResult(BaseModel):
-    hazardous: bool
-    deny: bool
-    cutoff: str
-    action: str
+# ---------- database ----------
+def db():
+    c = sqlite3.connect("saathi.db")
+    c.execute("""CREATE TABLE IF NOT EXISTS checkins(id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, ts TEXT,
+                 tier TEXT, stress INTEGER, themes TEXT, quote TEXT, summary TEXT, transcript TEXT)""")
+    return c
 
-class StudentRecord(BaseModel):
-    name: str
-    photo_url: Optional[str]
-    grade: Optional[str]
-    timestamp: datetime
-    risk_tier: int
-    risk_likelihood: str
-    risk_factors: list
-    remediation: str
-    safety: SafetyResult
+def seed():
+    c = db()
+    if c.execute("SELECT COUNT(*) FROM checkins").fetchone()[0] == 0:
+        rows = [
+            ("Asha (demo)", "2026-10-19 10:00", "green", 1, "settled, good routine", "Sab theek chal raha hai.", "Student reports a stable week and good sleep.", "Sab theek chal raha hai."),
+            ("Rohan (demo)", "2026-10-19 10:20", "amber", 4, "exams, sleep", "Raat ko neend nahi aati.", "Student is anxious about mid-sems and sleeping poorly.", "Mid-sems ka stress hai, neend nahi aati."),
+            ("Meera (demo)", "2026-10-20 09:40", "green", 2, "workload", "Thoda busy hoon but manage ho jata hai.", "Student is busy but coping well.", "Thoda busy hoon but manage ho jata hai."),
+            ("Kabir (demo)", "2026-10-21 11:05", "amber", 3, "family pressure, backlog", "Ghar pe bhi pressure hai.", "Student mentions backlog and pressure from home.", "Backlog hai aur ghar pe pressure hai."),
+            ("Sneha (demo)", "2026-10-22 16:30", "red", 5, "withdrawal, hopelessness", "Koi fayda hi nahi hai.", "Student sounds hopeless and withdrawn. Needs a human follow-up soon.", "Sab heavy lagta hai, koi fayda nahi."),
+        ]
+        c.executemany("INSERT INTO checkins(name,ts,tier,stress,themes,quote,summary,transcript) VALUES(?,?,?,?,?,?,?,?)", rows)
+        c.commit()
+    c.close()
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-def risk_tier(keyword: str) -> int:
-    """Return risk tier (0-3) based on hopelessness keyword presence."""
-    kw = keyword.lower()
-    if "want die" in kw or "kill my self" in kw or "no reason to live" in kw:
-        return 3
-    if any(x in kw for x in ("kill myself", "end it all", "suicide", "take my life")):
-        return 2
-    if any(x in kw for x in ("don't want to live", "hopeless", "empty", "blackout")):
-        return 2
-    if any(x in kw for x in ("stressed", "anxious", "depressed", "overwhelmed", "burnout")):
-        return 1
-    if "fine" in kw or "okay" in kw or "meh" in kw:
-        return 0
-    return 0
-
-def parse_risk(text: str) -> RiskResult:
-    """Parse LLM JSON risk output with code-fence stripping."""
+# ---------- Sarvam calls ----------
+def stt(wav_bytes):
+    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as t:
+        t.write(wav_bytes)
+        path = t.name
     try:
-        text = text.strip()
-        if text.startswith("```"):
-            text = text.split("```", 1)[1].strip()
-        if text.endswith("```"):
-            text = text.rsplit("```", 1)[1].strip()
-        cleaned = json.loads(text)
-        return RiskResult(**cleaned)
-    except Exception:
-        return RiskResult(tier=2, likelihood="unclear", factors=["context unavailable"], remediation="please say more")
+        with open(path, "rb") as f:
+            r = client.speech_to_text.transcribe(file=f, model="saaras:v4", mode="codemix")
+    finally:
+        os.remove(path)
+    return (r.transcript or "").strip(), getattr(r, "language_code", None)
 
-def safety_check(text: str) -> SafetyResult:
-    text = text.lower()
-    hazardous = any(w in text for w in ("kill myself", "take my life", "end it all", "no reason to live", "want die"))
-    deny = any(w in text for w in ("kill myself", "take my life", "end it all"))
-    cutoff = "immediate human escalation" if deny else "no escalation required yet"
-    action = "transfer to human clinician now" if deny else "continue safe loop with follow-up"
-    return SafetyResult(hazardous=hazardous, deny=deny, cutoff=cutoff, action=action)
+def tts_lang(code):
+    c = (code or "hi-IN").lower()
+    return "mr-IN" if c.startswith("mr") else "en-IN" if c.startswith("en") else "hi-IN"
 
-def parse_json_response(text: str) -> dict:
-    text = text.strip()
-    if text.startswith("```"):
-        text = text.split("```", 1)[1].strip()
-    if text.endswith("```"):
-        text = text.rsplit("```", 1)[1].strip()
-    return json.loads(text)
+def tts(text, lang):
+    audio = client.text_to_speech.convert(text=text[:900], model="bulbul:v3", language_code=lang, speaker="shubh")
+    path = os.path.join(tempfile.gettempdir(), f"saathi_{datetime.datetime.now().timestamp()}.wav")
+    save(audio, path)
+    return path
 
-def next_turn(user_text: str, history: list) -> str:
-    """Generate LLM assistant reply and append to history."""
-    messages = history + [{"role": "user", "content": user_text}]
-    resp = client.chat.completions(messages=messages, model="sarvam-105b")
-    return resp.choices[0].message.content
+def llm(messages):
+    r = client.chat.completions(model="sarvam-105b", messages=messages)
+    out = r.choices[0].message.content or ""
+    return re.sub(r"<think>.*?</think>", "", out, flags=re.S).strip()
 
-def risk_json(text: str) -> dict:
-    text = text.strip()
-    if text.startswith("```"):
-        text = text.split("```", 1)[1].strip()
-    if text.endswith("```"):
-        text = text.rsplit("```", 1)[1].strip()
+# ---------- risk logic ----------
+def parse_json(s):
     try:
-        return json.loads(text)
+        return json.loads(s[s.index("{"): s.rindex("}") + 1])
     except Exception:
         return {}
 
-# ---------------------------------------------------------------------------
-# Database
-# ---------------------------------------------------------------------------
-def init_db() -> None:
-    with sqlite3.connect(DB_PATH) as conn:
-        conn.execute(
-            """CREATE TABLE IF NOT EXISTS conversations (
-               id INTEGER PRIMARY KEY AUTOINCREMENT,
-               timestamp TEXT,
-               student_name TEXT,
-               student_grade TEXT,
-               turn INTEGER,
-               user_text TEXT,
-               assistant_text TEXT,
-               risk_tier INTEGER,
-               risk_likelihood TEXT,
-               safety_action TEXT,
-               education_flag TEXT
-            )"""
-        )
-        conn.commit()
+def red_flag(text):
+    return any(re.search(p, text, flags=re.I) for p in RED_PATTERNS)
 
-def save_response(
-    student_name: str,
-    student_grade: Optional[str],
-    turn: int,
-    user_text: str,
-    assistant_text: str,
-    risk: dict,
-    safety_result: SafetyResult,
-) -> None:
-    risk_tier_val = risk.get("tier", 1)
-    risk_likelihood = risk.get("likelihood", "unknown")
-    risk_factors = risk.get("factors", [])
-    remediation = risk.get("remediation", "continue conversation")
-    danger = safety_result.deny or safety_result.hazardous
-    education_flag = "HIGH_RISK" if danger else "NORMAL"
-    with sqlite3.connect(DB_PATH) as conn:
-        conn.execute(
-            """INSERT INTO conversations
-               (timestamp, student_name, student_grade, turn, user_text, assistant_text,
-                risk_tier, risk_likelihood, safety_action, education_flag)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (
-                datetime.utcnow().isoformat() + "Z",
-                student_name,
-                student_grade,
-                turn,
-                user_text,
-                assistant_text,
-                risk_tier_val,
-                risk_likelihood,
-                safety_result.action,
-                education_flag,
-            ),
-        )
-        conn.commit()
+def analyse():
+    transcript = "\n".join(t for r, t in ss.chat if r == "user")
+    d = parse_json(llm([{"role": "system", "content": ANALYSIS_PROMPT}, {"role": "user", "content": transcript}]))
+    tier = d.get("risk_tier") if d.get("risk_tier") in RANK else "amber"  # parse failure -> amber
+    if red_flag(transcript):
+        tier = "red"  # rules can only raise
+    try:
+        stress = max(1, min(5, int(d.get("stress_score", 3))))
+    except Exception:
+        stress = 3
+    themes = ", ".join(map(str, d.get("themes", []))) if isinstance(d.get("themes"), list) else ""
+    res = dict(name=ss.get("name") or "Student", ts=datetime.datetime.now().strftime("%Y-%m-%d %H:%M"), tier=tier,
+               stress=stress, themes=themes, quote=str(d.get("key_quote", "")),
+               summary=str(d.get("english_summary", "Summary unavailable; please review the transcript.")), transcript=transcript)
+    c = db()
+    c.execute("INSERT INTO checkins(name,ts,tier,stress,themes,quote,summary,transcript) VALUES(?,?,?,?,?,?,?,?)",
+              (res["name"], res["ts"], res["tier"], res["stress"], res["themes"], res["quote"], res["summary"], res["transcript"]))
+    c.commit()
+    c.close()
+    return res
 
-# ---------------------------------------------------------------------------
-# Seed dummy students
-# ---------------------------------------------------------------------------
-SEED_STUDENTS = [
-    {"name": "Priya Sharma", "photo_url": "https://i.pravatar.cc/150?img=32"},
-    {"name": "Aryan Nair", "photo_url": "https://i.pravatar.cc/150?img=10"},
-    {"name": "Kavya Pillai", "photo_url": "https://i.pravatar.cc/150?img=27"},
-    {"name": "Siddharth Rao", "photo_url": "https://i.pravatar.cc/150?img=53"},
-    {"name": "Divya Menon", "photo_url": "https://i.pravatar.cc/150?img=20"},
-]
-GRADE_OPTIONS = ["7", "8", "9", "10", "11", "12"]
+def process(wav):
+    with st.spinner("Samajh raha hoon..."):
+        text, code = stt(wav)
+        if not text:
+            st.warning("Kuch sunai nahi diya, dobara try karein.")
+            return
+        ss.chat.append(("user", text))
+        ss.lang = tts_lang(code)
+        msgs = [{"role": "system", "content": AGENT_SYS + " " + TURN_HINT[ss.turn]}]
+        msgs += [{"role": "user" if r == "user" else "assistant", "content": t} for r, t in ss.chat[1:]]
+        reply = llm(msgs) or "Shukriya batane ke liye. Main sun raha hoon."
+        ss.chat.append(("assistant", reply))
+        ss.turn += 1
+        speak = reply
+        if ss.turn == 3:
+            ss.result = analyse()
+            ss.done = True
+            if ss.result["tier"] == "red":
+                speak, ss.lang = RED_MSG, "hi-IN"
+        ss.audio = tts(speak, ss.lang)
+        ss.autoplay = True
+    st.rerun()
 
-# ---------------------------------------------------------------------------
-# Sidebar
-# ---------------------------------------------------------------------------
-with st.sidebar:
-    st.title("Saathi")
-    if st.checkbox("Student Guide view"):
-        st.info("This will show a simplified prompt flow for demo messaging.")
-    st.subheader("Student Selector")
-    session_state = st.session_state
-    if "students" not in session_state:
-        session_state.students = SEED_STUDENTS[:]
-    student = st.selectbox("Choose student", session_state.students, key="student_selector")
-    student_name = f"{student['name']}"
-    grade = st.selectbox("Grade", [""] + GRADE_OPTIONS, key="grade_selector")
-    test_clip_btn = st.checkbox("Use test clip", key="test_clip")
-    if test_clip_btn:
-        st.text("Loading test audio…")
-        if not TEST_CLIP_PATH or not os.path.exists(TEST_CLIP_PATH):
-            st.error("No test clip found; set SAATHI_TEST_CLIP path or disable the checkbox.")
-        else:
-            session_state.test_audio = TEST_CLIP_PATH
-    session_state.grade = grade
+# ---------- UI ----------
+seed()
+view = st.sidebar.radio("View", ["Student check-in", "Student Guide view"])
+src = st.sidebar.radio("Audio input", ["Microphone", "Use test clip"])
 
-# ---------------------------------------------------------------------------
-# Setup
-# ---------------------------------------------------------------------------
-if not os.environ.get("SAATHI_NOINIT", "").lower() == "true":
-    init_db()
-
-# ---------------------------------------------------------------------------
-# Page layout
-# ---------------------------------------------------------------------------
-st.set_page_config(page_title="Saathi", layout="centered")
-with st.container():
-    header = st.empty()
-    if "turn" not in session_state:
-        session_state.turn = 0
-        session_state.transcript = []
-    if "history" not in session_state:
-        session_state.history = []
-    if "consent" not in session_state:
-        session_state.consent = False
-    if "consent_time" not in session_state:
-        session_state.consent_time = ""
-    if "risk_result" not in session_state:
-        session_state.risk_result = RiskResult(tier=0, likelihood="none", factors=[], remediation="Begin session")
-    if "safety_result" not in session_state:
-        session_state.safety_result = SafetyResult(hazardous=False, deny=False, cutoff="no escalation", action="continue")
-    if not session_state.consent:
-        header.info(
-            "**Saathi** is a wellness voice agent.\n"
-            "It uses your voice to check in, answers in several Indian languages, and recommends resources.\n\n"
-            "Instructions:\n"
-            "1. Give consent.\n"
-            "2. Choose your language and speak.\n"
-            "3. The app listens, responds, and checks for risk.\n"
-            "4. Keep the session private; do not mention names of others.\n\n"
-            "Risk level is estimated and not a diagnosis. If you are in danger, call emergency services or talk to a trusted adult immediately."
-        )
-        header.markdown("## Consent required")
-        if st.button("I consent and want to continue", type="primary"):
-            session_state.consent = True
-            session_state.consent_time = datetime.utcnow().isoformat() + "Z"
-            header.success("Consent recorded. You may now choose a language and speak.")
-    else:
-        header.success(f"Welcome, {student_name}! Ready to start.")
-        st.markdown("---")
-        lang = st.selectbox("Language", ["en", "hi", "ta", "te", "kn"], key="lang")
-        audio_input = st.file_uploader("Send voice / upload audio", type=["wav", "ogg", "mp3"], key="upload")
-        if audio_input:
-            session_state.test_audio = audio_input.name
-            session_state.transcript = []
-            session_state.turn = 0
-            st.info("Test clip loaded. Run transcription, LLM, and TTS in the background if keys are valid.")
-        if "test_audio" in session_state:
-            result = client.speech_to_text.transcribe(
-                file=open(session_state.test_audio, "rb"),
-                model="saaras:v4",
-                mode="codemix",
-            )
-            transcript = result.transcript
-            session_state.transcript = transcript
-            st.info(f"STT output: {transcript[:200]}")
-        if "transcript" in session_state and session_state.transcript:
-            user_text = session_state.transcript[0] if session_state.transcript else ""
-            st.text_input("Edit transcript (optional)", key="edit_transcript", value=user_text)
-            user_text = user_text or st.session_state.edit_transcript
-            if user_text:
-                session_state.turn += 1
-                session_state.history.append({"role": "user", "content": user_text})
-                with st.spinner("Thinking…"):
-                    assistant_text = next_turn(user_text, session_state.history)
-                if assistant_text:
-                    session_state.history.append({"role": "assistant", "content": assistant_text})
-                    save_response(
-                        student_name=student_name,
-                        student_grade=session_state.grade,
-                        turn=session_state.turn,
-                        user_text=user_text,
-                        assistant_text=assistant_text,
-                        risk=session_state.risk_result._dict(),
-                        safety_result=session_state.safety_result,
-                    )
-                    if not session_state.test_audio:
-                        text_for_tts = assistant_text[:3000]
-                        st.info(f"LLM response set. Use TTS if API key is correct.")
-    # -----------------------------------------------------------------------
-    # Risk / Safety + sentiment display
-    # -----------------------------------------------------------------------
-    st_risk = session_state.risk_result
-    st_safety = session_state.safety_result
-    risk_color = {"green": "green", "amber": "yellow", "red": "red"}[st_risk.tier % 3]
-    status = "🟢 green" if st_risk.tier <= 1 else "🟡 amber" if st_risk.tier == 2 else "🔴 red"
-    st.markdown("---")
-    st.markdown(f"## Status: {status}")
-    factors = ", ".join(st_risk.factors) if st_risk.factors else "none"
-    st.write(
-        f"**Likelihood:** {st_risk.likelihood}  \n"
-        f"**Factors:** {factors}  \n"
-        f"**Remediation:** {st_risk.remediation}"
-    )
-    st.markdown("### Safety")
-    st.write(f"Assessment: {st_safety.cutoff}  ")
-    st.write(f"Action: {st_safety.action}")
-    # -----------------------------------------------------------------------
-    # Dashboard accordion
-    # -----------------------------------------------------------------------
-    with st.expander("Dataset & schema"):
-        with st.container():
-            conn = sqlite3.connect(DB_PATH)
-            dc = conn.execute(
-                "SELECT * FROM conversations ORDER BY rowid DESC LIMIT 1;"
-            ).fetchone()
-            if dc:
-                cols = [desc[0] for desc in conn.execute("PRAGMA table_info(conversations)").fetchall()]
-                df = conn.execute(
-                    "SELECT * FROM conversations ORDER BY turn DESC LIMIT 10;"
-                ).fetchall()
-            conn.close()
-            st.json(dict(zip(cols, dc)) if dc else "No rows")
-
-# ---------------------------------------------------------------------------
-# Footer
-# ---------------------------------------------------------------------------
-with st.container():
-    st.markdown("---")
-    st.markdown(f"Saathi (demo) — timestamp {datetime.utcnow().isoformat()}Z")
+if view == "Student check-in":
+    st.title("🎙️ Saathi: weekly wellness check-in")
+    for k, v in dict(turn=0, chat=[("assistant", OPENER)], done=False, audio=None, autoplay=False, lang="hi-IN", result=None).items():
+        ss.setdefault(k, v)
+    st.text_input("Name", value="Student", key="name")
+    if not st.checkbox("I understand Saathi is an AI, my Student Guide can see a summary, and I can stop anytime."):
+        st.stop()
+    for role, text in ss.chat:
+        with st.chat_message("assistant" if role == "assistant" else "user"):
+            st.write(text)
+    if ss.audio:
+        try:
+            st.audio(ss.audio, autoplay=ss.autoplay)
+        except TypeError:
+            st.audio(ss.audio)
+        ss.autoplay = False
+    if ss.done and ss.result:
+        r = ss.result
+        st.subheader(f"Check-in complete {ICON[r['tier']]} {r['tier'].upper()}")
+        if r["tier"] == "red":
+            st.error(RED_MSG)
+        st.caption("Your Student Guide can now see the summary.")
+        if st.button("Start a new check-in"):
+            for k in ["turn", "chat", "done", "audio", "autoplay", "lang", "result"]:
+                ss.pop(k, None)
+            st.rerun()
+    elif ss.turn < 3:
+        a = (st.audio_input("Speak", key=f"mic{ss.turn}") if src == "Microphone"
+             else st.file_uploader("Upload a test .wav clip", type=["wav"], key=f"up{ss.turn}"))
+        if a is not None:
+            try:
+                process(a.getvalue())
+            except Exception as e:
+                st.error(f"Something went wrong: {e}")
+else:
+    st.title("Student Guide dashboard")
+    c = db()
+    df = pd.read_sql_query("SELECT * FROM checkins", c)
+    c.close()
+    df["rank"] = df["tier"].map(RANK)
+    df = df.sort_values(["rank", "ts"], ascending=[False, False])
+    df["Risk"] = df["tier"].map(ICON) + " " + df["tier"]
+    a, b, c3 = st.columns(3)
+    a.metric("Check-ins", len(df))
+    b.metric("Red", int((df.tier == "red").sum()))
+    c3.metric("Amber", int((df.tier == "amber").sum()))
+    st.dataframe(df[["Risk", "name", "stress", "themes", "quote", "summary", "ts"]], hide_index=True)
+    for _, row in df.iterrows():
+        with st.expander(f"{ICON[row['tier']]} {row['name']} · {row['ts']}"):
+            st.write("**Summary:**", row["summary"])
+            st.write("**Key quote:**", row["quote"])
+            st.write("**Transcript:**", row["transcript"])
